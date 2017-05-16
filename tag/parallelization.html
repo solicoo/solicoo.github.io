@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <title>testpelican - Parallelization</title>
+        <link rel="stylesheet" href="http/theme/css/main.css" />
+        <link href="http/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="testpelican Atom Feed" />
+
+        <!--[if IE]>
+            <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+        <![endif]-->
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="http/">testpelican </a></h1>
+                <nav><ul>
+                    <li><a href="http/category/misc.html">misc</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+
+            <aside id="featured" class="body">
+                <article>
+                    <h1 class="entry-title"><a href="http/shen-wei-tai-hu-zhi-guang-chu-ti-yan.html">神威·太湖之光初体验</a></h1>
+<footer class="post-info">
+        <abbr class="published" title="2017-04-06T16:05:24+02:00">
+                Published: Thu 06 April 2017
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http/author/yifeng-tang.html">Yifeng Tang</a>
+        </address>
+<p>In <a href="http/category/misc.html">misc</a>.</p>
+<p>tags: <a href="http/tag/contest.html">Contest</a> <a href="http/tag/parallelization.html">Parallelization</a> </p>
+</footer><!-- /.post-info --><h1>神威·太湖之光初体验</h1>
+<div class="highlight"><pre><span></span>在ASC17的比赛中，本菜鸡负责了MASNUM这样一个从上世纪90年代就开始发展的海浪模拟应用的在神威·太湖之光上的优化任务（虽然最后并没能在要求时间内跑完最后一个workload。。账号一开始被赛委会删了可能也是一个原因（？！！）。。），并且借此机会也尝试了一下神威的速度，同时踩了上面的许许多多的坑。
+</pre></div>
+
+
+<h2>神威的结构</h2>
+<p><img alt="神威的结构图" src="/images/2017_4_30_1.png"></p>
+<p>神威采用的是完全国产的SW26010处理器，其中每一个处理器有四个核组（CGs),这些核组之间是通过一个芯片上的网络互相连接的。每一个CG包含了一个内存管理器（MC）、消息处理核心（MPE）、计算处理核心集群（CPEs)。其中MPE支持完整的中断功能，内存管理，超标量和乱序问题/执行，擅长处理管理，任务进度和数据通信，而CPEs旨在最大限度地提高聚合计算吞吐量，同时最小化微架构的复杂性。相对于MPE，CPE不支持中断。</p>
+<!--more-->
+
+<p>其中MPE主频为1.45GHz，每一个核组内存8GB，L1缓存32KB，L2缓存256KB，核组之间的一般通过MPI进行通讯。从核主频为1.45GHz，每一个从核分别有64KB的局部存储空间，从核可以通过gld／gst离散访问或者DMA批量访问主寸，从核阵列之间可以通过寄存器通信进行低延迟的通信。有意思的是，CPE的LDM在栈空间很大时，可能会使得栈空间、局存、动态分配的空间相互冲突，如下图所示。如果想要发生冲突的时候报错，需要加入-preserve preserve_size编译命令。</p>
+<p><img alt="LDM的使用情况" src="/images/2017_4_30_2.png"></p>
+<h2>MASNUM的优化思路</h2>
+<p>由于在去年的SC大会上，一篇关于在神威上对MASNUM的优化的论文成功进入了Gorden Bell Prize的提名，所以几乎所有的队伍都是在做着成功实现论文的工作。</p>
+<p><a href="http://dblp2.uni-trier.de/db/conf/sc/sc2016.html">A highly effective global surface wave numerical simulation with ultra-high resolution. 46-56</a></p>
+<p>论文上实现了三部分的优化，不过就算是做得最好的清华似乎也只是实现了其中的第二部分，简单点说就是把所有的运算全部扔到CPEs中进行并行计算，而我们也是在试图实现第二部分的优化。</p>
+<p>经过分析可以发现其中有两个子程序implsch、propagat是整个程序的热点（最后交卷的时候只让填这两个子程序的运行时间也能看出来这点）。其中implsch是很容易优化的，因为implsch使用的所有数组数据都并没有超出循环变量的范围，通过分组映射发射之类的办法很容易就能把相应数据填入CPEs之中，从而榨干CPE的所有局部内存。然而propagat我们到最后也没能实现，因为其中有一个数据规模随着输入平方级增加的四位数组在程序上表现为是乱序使用数据的，在程序运行之前是无法预测可能需要哪一个数据的。。最后试着每次循环都离散读取这8个变量，反而运行时间提升了4倍。。从清华他们那里打听了消息，原来这8个变量就是一个九宫格中间那一个点附近周围的8个，但是我们只是一开始猜想了一下并没有仔细推论。。（同队的大佬一开始就说可能是在计算微分方程，但我和另一个哥们都没能引起重视继续向下思考，毕竟这程序写得就像那一坨那啥）</p>
+<h2>神威上的加速库（Fortran下的）</h2>
+<div class="highlight"><pre><span></span>神威上的加速库的目标差不多，就是将程序划分为host、slave两块，然后让MPE运行host的内存，CPE运行slave的内容。从编译器必须加 -host 、 -slave 或者 -hybrid 也能看出来这一点。
+</pre></div>
+
+
+<h3>Open-ACC*</h3>
+<p>神威上的Open-ACC*是在Open-ACC 2.0的基础上进行魔改之后的东西。虽然我们和清华交流的时候统一了这东西不知道有什么意义、只会越跑越慢的意见，但是本菜鸡自己还是觉得可能是我们的打开方式都有点不对，不过现在也没办法试验，只能把其中遇见的问题再留在这里。</p>
+<ol>
+<li>
+<p>似乎没能够将数组很好地分块</p>
+<p>对于一个四维数组例如e(a, b, c, d)，如果关键循环变量是a，b的话，Open-ACC*似乎没有办法能够将a，b下的其他两个维度的数据拿出来，就算能够拿出来也似乎没有办法将在a，b两个维度上进行分段批量读取。（至少文档上完全没提到）</p>
+</li>
+<li>
+<p>似乎只能把数组按照循环变量进行分块</p>
+<p>但有一些例如propagat这样需要获取附近的8个点的数据的操作，Open-ACC*可能很难实现。</p>
+</li>
+<li>
+<p>文档上的很多看似很简单的功能实际上极难实现</p>
+<p>反正菜鸡我照着这个文档做，基本都是在无限报错。</p>
+</li>
+<li>
+<p>加速区只能是循环，且不允许两个加速区的并列</p>
+<p>这一点就真的有点烦躁，有些时候你将会需要一些例如一部分CPE进行读取、一部分CPE进行转发、一部分CPE进行计算这样的复杂功能，然后就会发现Open-ACC*就不能执行这样的复杂操作。</p>
+</li>
+</ol>
+<p>综上所述，我建议如果你的程序是对数组读取非常简单，或者是数组很小，并且不需要让每一个CPE分别有自己特殊的职责的话，可以选择使用Open-ACC*来进行优化。</p>
+<p>菜鸡我一开始就是使用Open-ACC*来进行的优化，优化的最好效果是让时间翻倍。。。（不过还是有队伍使用Open-ACC成功进行了优化，我确实很好奇到底是怎样完成的。。或许从一开始就已经分出了胜负）</p>
+<h3>Athread</h3>
+<div class="highlight"><pre><span></span>神威上的Athread的文档全是用C来写的，然而MASNUM却是一个Fortran写的程序，我们一开始以为应该C有的API、Fortran也应该都有，然而真相是非常的残酷。所以以后一定要把全部代码用C重写一次，否则会感到非常绝望。（至少要混合编译将C的API给包装过来）
+</pre></div>
+
+
+<p>Athread是一个相对于Open-ACC*来说更加靠谱的库，它的功能更加复杂且强大，不过我们也只是用了最基础的几个操作就完成了对implsch的优化，并且使得它的运行速度提高了100倍（从15000s的运行时间到了150s）。在这里就大致介绍一下关键的函数或者说子程序。</p>
+<h4>host部分</h4>
+<ol>
+<li>
+<p>athread_init()</p>
+<p>启动整个加速线程库，可以选择在程序最开始就初始化。说不定有什么性能的影响，菜鸡我也没办法再试验了。</p>
+</li>
+<li>
+<p>athread_spawn(fun, address)</p>
+<p>创建线程组，其中第一个参数是相应slave程序的函数，一般会写到另一个文件然后用external来调用，第二个参数是参数的起始地址。可以感觉到如果有多个参数将会非常的不方便，所以就用全局变量进行传递其实更好一些，具体效率在下也没测试。</p>
+</li>
+<li>
+<p>athread_join()</p>
+<p>阻塞等待线程组的全部结束。这个函数可以在MPE经过其他运算之后再调用，这样就实现了更进一步的并行。</p>
+</li>
+<li>
+<p>athread_halt()</p>
+<p>将整个加速线程库全部关闭，可以丢在程序最后面去。</p>
+</li>
+</ol>
+<h4>slave部分</h4>
+<p>slave文件中是通过/Common/区来进行对主存的直接访问，其中动态数组只能全部改成pointer然后来进行共享。然而CPEs内部的共享在下没能找到对应的API以及方法，提供的Openmp预编译指令也没能按照文档上所写的实现它的功能。。希望下一次能够找到方法。</p>
+<ol>
+<li>
+<p>get_myid()</p>
+<p>这个最关键的获取cpe自己的逻辑顺序的API在Fortran里面其实是没有的。。。赛委会给我们现场拷来了C语言的实现，然后混合编译进行调用。。真有意思。。（源代码我就不上传了，还是有点虚）</p>
+</li>
+<li>
+<p>athread_get(0, src, des, len, reply, 0, 0, 0)</p>
+<p>这几个0其实都有自己的意义，但是我们一般都不会用到。。想仔细用查查文档吧，可能会有进一步的提升。src是指经过common区共享的主内存的数据，des是指LDM中对应的数据位置，len是以字节计算的长度，reply是一个计数变量，会在get成功之后自增1。例程上面使用了简单的do while来进行等待，但是实际操作时，神威的工程师告诉我们，编译器可能会优化掉do while里面的reply从而使得整个程序卡住。所以尽量将do while写到另一个文件里面然后编译这个文件时加上-O0或者是-g（神威里面的-g默认-O0），从而避免这个优化。</p>
+</li>
+<li>
+<p>athread_put(0, src, des, len, reply, 0, 0)</p>
+<p>除了des与src是反着的，其他基本同上。</p>
+</li>
+<li>
+<p>ldm_malloc</p>
+<p>不好意思，Fortran里面没有，不过也可以完全避免动态数组的出现。</p>
+</li>
+</ol>
+<h2>具体并行思路</h2>
+<p>由于程序就是循环构成的，并行思路也比较简单，大致如下：</p>
+<ol>
+<li>
+<p>先估算每一个点所需要的内存大小；</p>
+</li>
+<li>
+<p>用64kb除以估算的内存大小，就可以得到最多能够一次存下的点的数量；</p>
+</li>
+<li>
+<p>通过总点数/(点的数量*64)，就可以得到想要把所有数据全部计算所需要的大的循环的次数；</p>
+</li>
+<li>
+<p>每一次批量读取数据进行计算再批量取出即可;</p>
+</li>
+<li>
+<p>某些变量以及固定长度的数组每一个CPE在一开始一起读入即可。</p>
+</li>
+</ol>
+<p>具体关键映射操作如下Java代码所示（Fortran数组是从1开始计算的）</p>
+<p>其中ixs、ixl、iys、iyl是点的范围，max_cpe_size是估算的最大点数，how_many是最大能够平均分配的循环次数，left_part是余下数量。</p>
+<p>计算之后steps是当前需要计算的长度，简单的从1到steps循环即可。</p>
+<div class="highlight"><pre><span></span><span class="kd">public</span> <span class="kd">class</span> <span class="nc">Test</span> <span class="o">{</span>
+
+    <span class="kd">public</span> <span class="kd">static</span> <span class="kt">void</span> <span class="nf">main</span><span class="o">(</span><span class="n">String</span><span class="o">[]</span> <span class="n">args</span><span class="o">)</span> <span class="o">{</span>
+        <span class="kt">int</span> <span class="n">ixl</span> <span class="o">=</span> <span class="mi">10000</span><span class="o">,</span> <span class="n">iyl</span> <span class="o">=</span> <span class="mi">10</span><span class="o">;</span>
+        <span class="kt">int</span> <span class="n">ixs</span> <span class="o">=</span> <span class="mi">1</span><span class="o">,</span> <span class="n">iys</span> <span class="o">=</span> <span class="mi">1</span><span class="o">;</span>
+        <span class="kt">int</span> <span class="n">max_cpe_size</span> <span class="o">=</span> <span class="mi">350</span><span class="o">;</span>
+        <span class="kt">int</span> <span class="n">how_many</span> <span class="o">=</span> <span class="o">(</span><span class="n">iyl</span> <span class="o">-</span> <span class="n">iys</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">/</span> <span class="o">(</span><span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">);</span>
+        <span class="kt">int</span> <span class="n">left_part</span> <span class="o">=</span> <span class="o">(</span><span class="n">iyl</span> <span class="o">-</span> <span class="n">iys</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">-</span> <span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">;</span>
+        <span class="kt">int</span> <span class="n">steps</span> <span class="o">=</span> <span class="mi">0</span><span class="o">,</span> <span class="n">ia</span> <span class="o">=</span> <span class="mi">0</span><span class="o">,</span> <span class="n">ic</span> <span class="o">=</span> <span class="mi">0</span><span class="o">,</span> <span class="n">my_id</span><span class="o">,</span> <span class="n">step_base</span><span class="o">,</span> <span class="n">step_left</span><span class="o">;</span>
+
+        <span class="k">for</span> <span class="o">(</span><span class="kt">int</span> <span class="n">big_loop</span> <span class="o">=</span> <span class="mi">1</span><span class="o">;</span> <span class="n">big_loop</span> <span class="o">&lt;=</span> <span class="n">how_many</span> <span class="o">+</span> <span class="mi">1</span><span class="o">;</span> <span class="n">big_loop</span><span class="o">++)</span> <span class="o">{</span>
+            <span class="k">for</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">=</span> <span class="mi">1</span><span class="o">;</span> <span class="n">my_id</span> <span class="o">&lt;=</span> <span class="mi">64</span><span class="o">;</span> <span class="n">my_id</span><span class="o">++)</span> <span class="o">{</span>
+                <span class="k">if</span> <span class="o">(</span><span class="n">big_loop</span> <span class="o">!=</span> <span class="n">how_many</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">{</span>
+                    <span class="n">steps</span> <span class="o">=</span> <span class="n">max_cpe_size</span><span class="o">;</span>
+                    <span class="n">ic</span> <span class="o">=</span> <span class="o">(((</span><span class="n">big_loop</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span><span class="o">)</span> <span class="o">/</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                    <span class="n">ia</span> <span class="o">=</span> <span class="o">(((</span><span class="n">big_loop</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span><span class="o">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                <span class="o">}</span> <span class="k">else</span> <span class="o">{</span>
+                    <span class="n">step_base</span> <span class="o">=</span> <span class="n">left_part</span> <span class="o">/</span> <span class="mi">64</span><span class="o">;</span>
+                    <span class="n">step_left</span> <span class="o">=</span> <span class="n">left_part</span> <span class="o">-</span> <span class="n">step_base</span> <span class="o">*</span> <span class="mi">64</span><span class="o">;</span>
+                    <span class="k">if</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">&lt;=</span> <span class="n">step_left</span><span class="o">)</span> <span class="o">{</span>
+                        <span class="n">steps</span> <span class="o">=</span> <span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span><span class="o">;</span>
+                        <span class="n">ic</span> <span class="o">=</span> <span class="o">((</span><span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">steps</span><span class="o">)</span> <span class="o">/</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                        <span class="n">ia</span> <span class="o">=</span> <span class="o">((</span><span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">steps</span><span class="o">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                    <span class="o">}</span> <span class="k">else</span> <span class="o">{</span>
+                        <span class="n">steps</span> <span class="o">=</span> <span class="n">step_base</span><span class="o">;</span>
+                        <span class="n">ic</span> <span class="o">=</span> <span class="o">((</span><span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">step_left</span><span class="o">)</span> <span class="o">*</span> <span class="o">(</span><span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="n">step_left</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">steps</span><span class="o">)</span> <span class="o">/</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                        <span class="n">ia</span> <span class="o">=</span> <span class="o">((</span><span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">step_left</span><span class="o">)</span> <span class="o">*</span> <span class="o">(</span><span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span><span class="o">)</span> <span class="o">+</span> <span class="o">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="n">step_left</span> <span class="o">-</span> <span class="mi">1</span><span class="o">)</span> <span class="o">*</span> <span class="n">steps</span><span class="o">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="o">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="o">);</span>
+                    <span class="o">}</span>
+                <span class="o">}</span>
+                <span class="n">ic</span> <span class="o">=</span> <span class="n">ic</span> <span class="o">+</span> <span class="mi">1</span><span class="o">;</span>
+                <span class="n">ia</span> <span class="o">=</span> <span class="n">ia</span> <span class="o">+</span> <span class="mi">1</span><span class="o">;</span>
+            <span class="o">}</span>
+        <span class="o">}</span>
+    <span class="o">}</span>
+<span class="o">}</span>
+</pre></div>
+
+
+<h2>出错整理</h2>
+<p>神威的Exception非常的不详细，甚至他们的工程师自己都在吐槽，不过本菜鸡经过认真的测试，大致发现了以下的对应的规律。</p>
+<ol>
+<li>
+<p>No SPE Exception</p>
+<p>可能是栈空间不足。</p>
+</li>
+<li>
+<p>Floating Pointer Exception</p>
+<p>可能是程序计算映射出错，导致内存溢出到非法区域。</p>
+</li>
+<li>
+<p>DMA Desxxxxxxxx? Exception</p>
+<p>可能是循环的时候未处理steps = 0的情况。</p>
+</li>
+<li>
+<p>Unknown Exception</p>
+<p>呃。。别问我发生了什么</p>
+</li>
+<li>
+<p>程序在athread_get卡住</p>
+<p>检查-cgsp -b参数，或者-O0参数进行测试</p>
+</li>
+</ol>
+<h2>资料出处</h2>
+<p><a href="http://www.nsccwx.cn">无锡国家计算中心官网</a></p>
+<h2>优化后实例代码</h2>
+<p>源文件：</p>
+<div class="highlight"><pre><span></span><span class="c">!-------------------------------------------------------------------------------</span>
+<span class="c">!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@</span>
+<span class="c">!-------------------------------------------------------------------------------</span>
+<span class="c">!*DeckYinxq: mean2</span>
+ <span class="c">! �����׾أ����ڼ���Դ����</span>
+
+  <span class="k">subroutine </span><span class="n">mean2</span>
+
+  <span class="k">implicit none</span>
+
+<span class="c">!-------------------------------------------------------------------------------</span>
+
+  <span class="kt">integer</span> <span class="kd">::</span> <span class="n">k</span><span class="p">,</span> <span class="n">k1</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">i1</span><span class="p">,</span> <span class="n">j</span>
+  <span class="kt">real</span> <span class="kd">::</span> <span class="n">dwkk</span><span class="p">,</span> <span class="n">wfk</span><span class="p">,</span> <span class="n">wfk1</span><span class="p">,</span> <span class="n">wsk</span><span class="p">,</span> <span class="n">wsk1</span><span class="p">,</span> <span class="n">wkk</span><span class="p">,</span> <span class="n">wkk1</span><span class="p">,</span> <span class="n">ekj</span><span class="p">,</span> <span class="n">ekj1</span>
+
+<span class="c">!-------------------------------------------------------------------------------</span>
+
+  <span class="k">do </span><span class="mi">100</span> <span class="n">ic</span><span class="o">=</span><span class="n">iys</span><span class="p">,</span><span class="n">iyl</span>
+  <span class="k">do </span><span class="mi">100</span> <span class="n">ia</span><span class="o">=</span><span class="n">ixs</span><span class="p">,</span><span class="n">ixl</span>
+
+    <span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="mf">0.</span>
+    <span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="mf">0.</span>
+    <span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="mf">0.</span>
+    <span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="mf">0.</span>
+    <span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="mf">0.</span>
+
+    <span class="k">if</span><span class="p">(</span><span class="n">nsp</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">).</span><span class="n">ne</span><span class="p">.</span><span class="mi">1</span><span class="p">)</span> <span class="k">cycle</span>
+
+<span class="k">    do </span><span class="mi">200</span> <span class="n">k</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span><span class="n">kld</span>
+      <span class="n">k1</span><span class="o">=</span><span class="n">k</span><span class="o">+</span><span class="mi">1</span>
+      <span class="n">i</span><span class="o">=</span><span class="n">k</span><span class="o">-</span><span class="n">kl</span><span class="o">+</span><span class="mi">1</span>
+      <span class="n">i1</span><span class="o">=</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span>
+      <span class="n">dwkk</span><span class="o">=</span><span class="n">dwk</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+      <span class="n">wfk</span><span class="o">=</span><span class="n">wf</span><span class="p">(</span><span class="n">k</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+      <span class="n">wfk1</span><span class="o">=</span><span class="n">wf</span><span class="p">(</span><span class="n">k1</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+      <span class="c">!      wfk=fr(k)</span>
+      <span class="c">!      wfk1=fr(k1)</span>
+      <span class="n">wsk</span><span class="o">=</span><span class="n">zpi</span><span class="o">*</span><span class="n">wfk</span>
+      <span class="n">wsk1</span><span class="o">=</span><span class="n">zpi</span><span class="o">*</span><span class="n">wfk1</span>
+      <span class="n">wkk</span><span class="o">=</span><span class="n">wk</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+      <span class="n">wkk1</span><span class="o">=</span><span class="n">wk</span><span class="p">(</span><span class="n">k1</span><span class="p">)</span>
+      <span class="k">do </span><span class="mi">200</span> <span class="n">j</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span><span class="n">jl</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">k</span><span class="p">.</span><span class="n">lt</span><span class="p">.</span><span class="n">kl</span><span class="p">)</span> <span class="k">then</span>
+<span class="k">          </span><span class="n">ekj</span><span class="o">=</span><span class="n">e</span><span class="p">(</span><span class="n">k</span><span class="p">,</span><span class="n">j</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+          <span class="n">ekj1</span><span class="o">=</span><span class="n">e</span><span class="p">(</span><span class="n">k1</span><span class="p">,</span><span class="n">j</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+        <span class="k">else</span>
+<span class="k">          </span><span class="n">ekj</span><span class="o">=</span><span class="n">e</span><span class="p">(</span><span class="n">kl</span><span class="p">,</span><span class="n">j</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">*</span><span class="n">wkh</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+          <span class="n">ekj1</span><span class="o">=</span><span class="n">e</span><span class="p">(</span><span class="n">kl</span><span class="p">,</span><span class="n">j</span><span class="p">,</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">*</span><span class="n">wkh</span><span class="p">(</span><span class="n">i1</span><span class="p">)</span>
+        <span class="n">endif</span>
+        <span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">+</span><span class="n">ekj1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+        <span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">*</span><span class="n">wfk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">*</span><span class="n">wfk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+        <span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">/</span><span class="n">wsk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">/</span><span class="n">wsk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+        <span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">*</span><span class="n">wkk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">*</span><span class="n">wkk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+        <span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">/</span><span class="nb">sqrt</span><span class="p">(</span><span class="n">wkk</span><span class="p">)</span><span class="o">+</span><span class="n">ekj1</span><span class="o">/</span><span class="nb">sqrt</span><span class="p">(</span><span class="n">wkk1</span><span class="p">))</span><span class="o">*</span><span class="n">dwkk</span>
+    <span class="mi">200</span>      <span class="k">continue</span>
+
+<span class="k">    </span><span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">/</span><span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+    <span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">/</span><span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+    <span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">/</span><span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span>
+    <span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">=</span><span class="p">(</span><span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">)</span><span class="o">/</span><span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span><span class="n">ic</span><span class="p">))</span><span class="o">**</span><span class="mi">2</span>
+
+  <span class="mi">100</span>      <span class="k">continue</span>
+
+<span class="c">!-------------------------------------------------------------------------------</span>
+
+  <span class="k">return</span>
+
+<span class="c">!-------------------------------------------------------------------------------</span>
+
+  <span class="k">end subroutine </span><span class="n">mean2</span>
+
+<span class="c">!-------------------------------------------------------------------------------</span>
+<span class="c">!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@</span>
+<span class="c">!-------------------------------------------------------------------------------</span>
+</pre></div>
+
+
+<p>host代码：</p>
+<div class="highlight"><pre><span></span><span class="k">subroutine </span><span class="n">mean2</span>
+
+    <span class="k">implicit none</span>
+
+<span class="k">    </span><span class="kt">integer</span> <span class="kd">::</span> <span class="n">how_many</span><span class="p">,</span> <span class="n">left_part</span>
+
+    <span class="kt">integer</span><span class="p">,</span><span class="k">external</span><span class="kd">::</span><span class="n">slave_mean2_slave</span>
+
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">max_cpe_size</span> <span class="o">=</span> <span class="mi">35</span>
+
+    <span class="k">common</span> <span class="o">/</span><span class="n">mean2_host_hm</span><span class="o">/</span> <span class="n">how_many</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">mean2_host_lp</span><span class="o">/</span> <span class="n">left_part</span>
+
+    <span class="n">how_many</span> <span class="o">=</span> <span class="p">(</span><span class="n">iyl</span> <span class="o">-</span> <span class="n">iys</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span>
+    <span class="n">left_part</span> <span class="o">=</span> <span class="p">(</span><span class="n">iyl</span> <span class="o">-</span> <span class="n">iys</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">ixl</span> <span class="o">-</span> <span class="n">ixs</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">how_many</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span>
+
+    <span class="k">call </span><span class="n">athread_spawn</span><span class="p">(</span><span class="n">slave_mean2_slave</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">call </span><span class="n">athread_join</span><span class="p">()</span>
+
+  <span class="k">return</span>
+
+<span class="k">end subroutine </span><span class="n">mean2</span>
+</pre></div>
+
+
+<p>slave代码:</p>
+<div class="highlight"><pre><span></span><span class="k">subroutine </span><span class="n">mean2_slave</span>
+
+    <span class="k">implicit none</span>
+
+<span class="k">    </span><span class="kt">integer</span> <span class="kd">::</span> <span class="n">my_id</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="n">fak</span>
+
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">how_many</span><span class="p">,</span> <span class="n">left_part</span>
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">big_loop</span><span class="p">,</span> <span class="n">steps</span><span class="p">,</span> <span class="n">step_left</span><span class="p">,</span> <span class="n">step_base</span>
+
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">k</span><span class="p">,</span> <span class="n">k1</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">i1</span><span class="p">,</span> <span class="n">j</span><span class="p">,</span> <span class="n">ia</span><span class="p">,</span> <span class="n">ic</span>
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="nb">count</span>
+<span class="nb">    </span><span class="kt">real</span> <span class="kd">::</span> <span class="n">dwkk</span><span class="p">,</span> <span class="n">wfk</span><span class="p">,</span> <span class="n">wfk1</span><span class="p">,</span> <span class="n">wsk</span><span class="p">,</span> <span class="n">wsk1</span><span class="p">,</span> <span class="n">wkk</span><span class="p">,</span> <span class="n">wkk1</span><span class="p">,</span> <span class="n">ekj</span><span class="p">,</span> <span class="n">ekj1</span>
+
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">kld</span> <span class="o">=</span> <span class="mi">30</span>
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">kl</span> <span class="o">=</span> <span class="mi">25</span>
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">jl</span> <span class="o">=</span> <span class="mi">12</span>
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">zpi</span> <span class="o">=</span> <span class="mf">3.1415926</span> <span class="o">*</span> <span class="mi">2</span>
+
+    <span class="kt">integer</span><span class="p">,</span> <span class="k">parameter</span> <span class="kd">::</span> <span class="n">max_cpe_size</span> <span class="o">=</span> <span class="mi">35</span>
+
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">iys</span><span class="p">,</span> <span class="n">iyl</span><span class="p">,</span> <span class="n">ixs</span><span class="p">,</span> <span class="n">ixl</span>
+    <span class="kt">real</span><span class="p">,</span> <span class="k">pointer</span> <span class="kd">::</span> <span class="n">ae</span><span class="p">(:,:),</span> <span class="n">asi</span><span class="p">(:,:),</span> <span class="n">awf</span><span class="p">(:,:),</span> <span class="n">awk</span><span class="p">(:,:),</span> <span class="n">ark</span><span class="p">(:,:),</span> <span class="n">nsp</span><span class="p">(:,:)</span>
+    <span class="kt">real</span><span class="p">,</span> <span class="k">pointer</span> <span class="kd">::</span> <span class="n">wf</span><span class="p">(:,</span> <span class="p">:,</span> <span class="p">:)</span>
+    <span class="kt">real</span><span class="p">,</span> <span class="k">pointer</span> <span class="kd">::</span> <span class="n">e</span><span class="p">(:,</span> <span class="p">:,</span> <span class="p">:,</span> <span class="p">:)</span>
+    <span class="kt">real</span> <span class="kd">::</span> <span class="n">dwk</span><span class="p">(</span><span class="mi">31</span><span class="p">),</span> <span class="n">wk</span><span class="p">(</span><span class="mi">31</span><span class="p">),</span> <span class="n">wkh</span><span class="p">(</span><span class="mi">31</span><span class="p">)</span>
+
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">how_many_slave</span><span class="p">,</span> <span class="n">left_part_slave</span>
+
+    <span class="kt">integer</span> <span class="kd">::</span> <span class="n">iys_slave</span><span class="p">,</span> <span class="n">iyl_slave</span><span class="p">,</span> <span class="n">ixs_slave</span><span class="p">,</span> <span class="n">ixl_slave</span>
+    <span class="kt">real</span> <span class="kd">::</span> <span class="n">dwk_slave</span><span class="p">(</span><span class="mi">31</span><span class="p">),</span> <span class="n">wk_slave</span><span class="p">(</span><span class="mi">31</span><span class="p">),</span> <span class="n">wkh_slave</span><span class="p">(</span><span class="mi">31</span><span class="p">)</span>
+    <span class="kt">real</span> <span class="kd">::</span> <span class="n">ae_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">),</span> <span class="n">asi_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">),</span> <span class="n">awf_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">),</span> <span class="n">awk_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">),</span> <span class="n">ark_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">),</span> <span class="n">nsp_slave</span><span class="p">(</span><span class="mi">35</span><span class="p">)</span>
+    <span class="kt">real</span> <span class="kd">::</span> <span class="n">wf_slave</span><span class="p">(</span><span class="mi">35</span> <span class="o">*</span> <span class="mi">31</span><span class="p">),</span> <span class="n">e_slave</span><span class="p">(</span><span class="mi">35</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span><span class="p">)</span>
+
+    <span class="kt">integer</span><span class="p">,</span><span class="k">external</span><span class="kd">::</span><span class="n">get_myid</span>
+
+    <span class="k">common</span> <span class="o">/</span><span class="n">mean2_host_hm</span><span class="o">/</span> <span class="n">how_many</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">mean2_host_lp</span><span class="o">/</span> <span class="n">left_part</span>
+
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_iys</span><span class="o">/</span> <span class="n">iys</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_iyl</span><span class="o">/</span> <span class="n">iyl</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_ixs</span><span class="o">/</span> <span class="n">ixs</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_ixl</span><span class="o">/</span> <span class="n">ixl</span>
+
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_ae</span><span class="o">/</span> <span class="n">ae</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_asi</span><span class="o">/</span> <span class="n">asi</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_awf</span><span class="o">/</span> <span class="n">awf</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_awk</span><span class="o">/</span> <span class="n">awk</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_ark</span><span class="o">/</span> <span class="n">ark</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_nsp</span><span class="o">/</span> <span class="n">nsp</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_wf</span><span class="o">/</span> <span class="n">wf</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_e</span><span class="o">/</span> <span class="n">e</span>
+
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_dwk</span><span class="o">/</span> <span class="n">dwk</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_wk</span><span class="o">/</span> <span class="n">wk</span>
+    <span class="k">common</span> <span class="o">/</span><span class="n">sh_wkh</span><span class="o">/</span> <span class="n">wkh</span>
+
+    <span class="n">fak</span> <span class="o">=</span> <span class="n">get_myid</span><span class="p">(</span><span class="n">my_id</span><span class="p">)</span>
+
+    <span class="n">how_many_slave</span><span class="o">=</span><span class="n">how_many</span>
+    <span class="n">left_part_slave</span><span class="o">=</span><span class="n">left_part</span>
+
+    <span class="n">iys_slave</span><span class="o">=</span><span class="n">iys</span>
+    <span class="n">ixs_slave</span><span class="o">=</span><span class="n">ixs</span>
+    <span class="n">iyl_slave</span><span class="o">=</span><span class="n">iyl</span>
+    <span class="n">ixl_slave</span><span class="o">=</span><span class="n">ixl</span>
+
+    <span class="n">reply</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dwk</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">dwk_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">31</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">wk</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">wk_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">31</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">wkh</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">wkh_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">31</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">do while</span><span class="p">(</span><span class="n">reply</span> <span class="p">.</span><span class="n">ne</span><span class="p">.</span> <span class="mi">3</span><span class="p">)</span>
+    <span class="k">end do</span>
+
+<span class="k">    do </span><span class="mi">9999</span> <span class="n">big_loop</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">how_many_slave</span> <span class="o">+</span> <span class="mi">1</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="n">big_loop</span> <span class="p">.</span><span class="n">ne</span><span class="p">.</span> <span class="n">how_many_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="k">then</span>
+<span class="k">            </span><span class="n">steps</span> <span class="o">=</span> <span class="n">max_cpe_size</span>
+            <span class="n">ic</span> <span class="o">=</span> <span class="p">(((</span><span class="n">big_loop</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">ia</span> <span class="o">=</span> <span class="p">(((</span><span class="n">big_loop</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_cpe_size</span><span class="p">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">ic</span> <span class="o">=</span> <span class="n">ic</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="n">ia</span> <span class="o">=</span> <span class="n">ia</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="k">else</span>
+<span class="k">            </span><span class="n">step_base</span> <span class="o">=</span> <span class="n">left_part</span> <span class="o">/</span> <span class="mi">64</span>   <span class="c">!34</span>
+            <span class="n">step_left</span> <span class="o">=</span> <span class="n">left_part</span> <span class="o">-</span> <span class="n">step_base</span> <span class="o">*</span> <span class="mi">64</span>   <span class="c">!56</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">my_id</span> <span class="p">.</span><span class="n">le</span><span class="p">.</span> <span class="n">step_left</span><span class="p">)</span> <span class="k">then</span>
+<span class="k">                </span><span class="n">steps</span> <span class="o">=</span> <span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">ic</span> <span class="o">=</span> <span class="p">((</span><span class="n">how_many_slave</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">steps</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">ia</span> <span class="o">=</span> <span class="p">((</span><span class="n">how_many_slave</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">steps</span><span class="p">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="k">else</span>
+<span class="k">                </span><span class="n">steps</span> <span class="o">=</span> <span class="n">step_base</span>
+                <span class="n">ic</span> <span class="o">=</span> <span class="p">((</span><span class="n">how_many_slave</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">step_left</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="n">step_left</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">steps</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">ia</span> <span class="o">=</span> <span class="p">((</span><span class="n">how_many_slave</span> <span class="o">*</span> <span class="n">max_cpe_size</span> <span class="o">*</span> <span class="mi">64</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">step_left</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">step_base</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">my_id</span> <span class="o">-</span> <span class="n">step_left</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">steps</span><span class="p">)</span> <span class="o">-</span> <span class="n">ic</span> <span class="o">*</span> <span class="p">(</span><span class="n">ixl_slave</span> <span class="o">-</span> <span class="n">ixs_slave</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">endif</span>
+            <span class="n">ic</span> <span class="o">=</span> <span class="n">ic</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="n">ia</span> <span class="o">=</span> <span class="n">ia</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="n">endif</span>
+
+        <span class="n">reply</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">ae_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">asi_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">awf_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">awk_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">ark_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">nsp</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">nsp_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">wf</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">wf_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">31</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_get</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">e</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span> <span class="n">e_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+        <span class="k">do while</span><span class="p">(</span><span class="n">reply</span> <span class="p">.</span><span class="n">ne</span><span class="p">.</span> <span class="mi">8</span><span class="p">)</span>
+        <span class="k">end do</span>
+
+<span class="k">        </span><span class="n">ae_slave</span> <span class="o">=</span> <span class="mf">0.</span>
+        <span class="n">asi_slave</span> <span class="o">=</span> <span class="mf">0.</span>
+        <span class="n">awf_slave</span> <span class="o">=</span> <span class="mf">0.</span>
+        <span class="n">awk_slave</span> <span class="o">=</span> <span class="mf">0.</span>
+        <span class="n">ark_slave</span> <span class="o">=</span> <span class="mf">0.</span>
+
+        <span class="k">do </span><span class="mi">99999</span> <span class="nb">count</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">steps</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="n">nsp_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span> <span class="p">.</span><span class="n">ne</span><span class="p">.</span> <span class="mi">1</span><span class="p">)</span> <span class="k">cycle</span>
+
+<span class="k">            do </span><span class="mi">200</span> <span class="n">k</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">kld</span>
+                <span class="n">k1</span> <span class="o">=</span> <span class="n">k</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">i</span> <span class="o">=</span> <span class="n">k</span> <span class="o">-</span> <span class="n">kl</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">i1</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">dwkk</span> <span class="o">=</span> <span class="n">dwk_slave</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+                <span class="n">wfk</span> <span class="o">=</span> <span class="n">wf_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">31</span> <span class="o">+</span> <span class="n">k</span><span class="p">)</span>   <span class="c">!(k, ia, ic)</span>
+                <span class="n">wfk1</span> <span class="o">=</span> <span class="n">wf_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">31</span> <span class="o">+</span> <span class="n">k1</span><span class="p">)</span> <span class="c">!(k1, ia, ic)</span>
+                <span class="n">wsk</span> <span class="o">=</span> <span class="n">zpi</span> <span class="o">*</span> <span class="n">wfk</span>
+                <span class="n">wsk1</span> <span class="o">=</span> <span class="n">zpi</span> <span class="o">*</span> <span class="n">wfk1</span>
+                <span class="n">wkk</span> <span class="o">=</span> <span class="n">wk_slave</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+                <span class="n">wkk1</span> <span class="o">=</span> <span class="n">wk_slave</span><span class="p">(</span><span class="n">k1</span><span class="p">)</span>
+                <span class="k">do </span><span class="mi">200</span> <span class="n">j</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">jl</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">k</span> <span class="p">.</span><span class="n">lt</span><span class="p">.</span> <span class="n">kl</span><span class="p">)</span> <span class="k">then</span>
+<span class="k">                        </span><span class="n">ekj</span> <span class="o">=</span> <span class="n">e_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span> <span class="o">+</span> <span class="p">(</span><span class="n">j</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">kl</span> <span class="o">+</span> <span class="n">k</span><span class="p">)</span>     <span class="c">!(k, j, ia, ic)</span>
+                        <span class="n">ekj1</span> <span class="o">=</span> <span class="n">e_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span> <span class="o">+</span> <span class="p">(</span><span class="n">j</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">kl</span> <span class="o">+</span> <span class="n">k1</span><span class="p">)</span>   <span class="c">!(k1, j, ia, ic)</span>
+                    <span class="k">else</span>
+<span class="k">                        </span><span class="n">ekj</span> <span class="o">=</span> <span class="n">e_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span> <span class="o">+</span> <span class="p">(</span><span class="n">j</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">kl</span> <span class="o">+</span> <span class="n">kl</span><span class="p">)</span> <span class="o">*</span> <span class="n">wkh_slave</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>    <span class="c">!(kl, j, ia, ic)</span>
+                        <span class="n">ekj1</span> <span class="o">=</span> <span class="n">e_slave</span><span class="p">((</span><span class="nb">count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">25</span> <span class="o">*</span> <span class="mi">12</span> <span class="o">+</span> <span class="p">(</span><span class="n">j</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">kl</span> <span class="o">+</span> <span class="n">kl</span><span class="p">)</span> <span class="o">*</span> <span class="n">wkh_slave</span><span class="p">(</span><span class="n">i1</span><span class="p">)</span>  <span class="c">!(kl, j, ia, ic)</span>
+                    <span class="n">endif</span>
+                    <span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">+</span><span class="n">ekj1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+                    <span class="n">awf_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">awf_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">*</span><span class="n">wfk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">*</span><span class="n">wfk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+                    <span class="n">asi_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">asi_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">/</span><span class="n">wsk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">/</span><span class="n">wsk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+                    <span class="n">awk_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">awk_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">*</span><span class="n">wkk</span><span class="o">+</span><span class="n">ekj1</span><span class="o">*</span><span class="n">wkk1</span><span class="p">)</span><span class="o">*</span><span class="n">dwkk</span>
+                    <span class="n">ark_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">ark_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">+</span><span class="p">(</span><span class="n">ekj</span><span class="o">/</span><span class="nb">sqrt</span><span class="p">(</span><span class="n">wkk</span><span class="p">)</span><span class="o">+</span><span class="n">ekj1</span><span class="o">/</span><span class="nb">sqrt</span><span class="p">(</span><span class="n">wkk1</span><span class="p">))</span><span class="o">*</span><span class="n">dwkk</span>
+            <span class="mi">200</span>         <span class="k">continue</span>
+
+<span class="k">            </span><span class="n">asi_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">/</span><span class="n">asi_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span>
+            <span class="n">awf_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">awf_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">/</span><span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span>
+            <span class="n">awk_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="n">awk_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">/</span><span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span>
+            <span class="n">ark_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">=</span><span class="p">(</span><span class="n">ae_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">)</span><span class="o">/</span><span class="n">ark_slave</span><span class="p">(</span><span class="nb">count</span><span class="p">))</span><span class="o">**</span><span class="mi">2</span>
+        <span class="mi">99999</span>   <span class="k">continue</span>
+
+<span class="k">        </span><span class="n">reply</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="k">call </span><span class="n">athread_put</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">ae_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">ae</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_put</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">asi_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">asi</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_put</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">awf_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">awf</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_put</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">awk_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">awk</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">call </span><span class="n">athread_put</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">ark_slave</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">ark</span><span class="p">(</span><span class="n">ia</span><span class="p">,</span> <span class="n">ic</span><span class="p">),</span>  <span class="mi">4</span> <span class="o">*</span> <span class="n">steps</span><span class="p">,</span> <span class="n">reply</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+        <span class="k">do while</span><span class="p">(</span><span class="n">reply</span> <span class="p">.</span><span class="n">ne</span><span class="p">.</span> <span class="mi">5</span><span class="p">)</span>
+        <span class="k">end do</span>
+
+<span class="k">    </span><span class="mi">9999</span>    <span class="k">continue</span>
+
+<span class="c">!==========================================================================================================================</span>
+
+<span class="k">end subroutine </span><span class="n">mean2_slave</span>
+</pre></div>
+
+
+<h2>结语</h2>
+<p>经过这次比赛，认识到了自己和顶尖选手的差距。不过差距也没有到达天壤之别的地步，希望明年能够提前多做准备，能够让华科和自己不要这样的丢脸。加油！</p>                </article>
+            </aside><!-- /#featured -->
+        <section id="extras" class="body">
+                <div class="blogroll">
+                        <h2>links</h2>
+                        <ul>
+                            <li><a href="http://getpelican.com/">Pelican</a></li>
+                            <li><a href="http://python.org/">Python.org</a></li>
+                            <li><a href="http://jinja.pocoo.org/">Jinja2</a></li>
+                            <li><a href="#">You can modify those links in your config file</a></li>
+                        </ul>
+                </div><!-- /.blogroll -->
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+                            <li><a href="http/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">atom feed</a></li>
+
+                            <li><a href="#">You can add links in your config file</a></li>
+                            <li><a href="#">Another social link</a></li>
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="http://getpelican.com/">Pelican</a>, which takes great advantage of <a href="http://python.org">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="http://coding.smashingmagazine.com/2009/08/04/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+</body>
+</html>
